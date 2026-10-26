@@ -1,0 +1,120 @@
+{
+  "policies": {
+    "ClearOnShutdown": {
+      "Cache": true,
+      "CookiesAndStorage": true
+    },
+    "Cookies": {
+      "Behavior": "reject-foreign",
+      "BehaviorPrivateBrowsing": "reject-foreign",
+      "Locked": true
+    },
+    "DisableFirefoxStudies": true,
+    "DisableTelemetry": true,
+    "EnableTrackingProtection": {
+      "Value": true,
+      "Locked": true,
+      "Category": "strict",
+      "BaselineExceptions": true,
+      "ConvenienceExceptions": false
+    },
+    "FirefoxHome": {
+      "SponsoredTopSites": false,
+      "Stories": false,
+      "SponsoredStories": false,
+      "Widgets": {
+        "Enabled": false
+      },
+      "Locked": true
+    },
+    "GenerativeAI": {
+      "Enabled": false,
+      "Chatbot": false,
+      "LinkPreviews": false,
+      "TabGroups": false,
+      "Locked": true
+    },
+    "HttpsOnlyMode": "force_enabled",
+    "Preferences": {
+      "browser.search.suggest.enabled": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "browser.urlbar.quicksuggest.enabled": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "browser.urlbar.speculativeConnect.enabled": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "browser.urlbar.suggest.quicksuggest.sponsored": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "browser.urlbar.suggest.searches": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "media.peerconnection.ice.default_address_only": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "media.peerconnection.ice.no_host": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "network.dns.disablePrefetch": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "network.http.speculative-parallel-limit": {
+        "Value": 0,
+        "Status": "locked",
+        "Type": "number"
+      },
+      "network.prefetch-next": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "privacy.globalprivacycontrol.enabled": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "privacy.resistFingerprinting": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "privacy.resistFingerprinting.letterboxing": {
+        "Value": true,
+        "Status": "locked",
+        "Type": "boolean"
+      },
+      "security.ssl.errorReporting.enabled": {
+        "Value": false,
+        "Status": "locked",
+        "Type": "boolean"
+      }
+    },
+    "UserMessaging": {
+      "ExtensionRecommendations": false,
+      "FeatureRecommendations": false,
+      "UrlbarInterventions": false,
+      "SkipOnboarding": true,
+      "MoreFromMozilla": false,
+      "FirefoxLabs": false,
+      "Locked": true
+    }
+  }
+}

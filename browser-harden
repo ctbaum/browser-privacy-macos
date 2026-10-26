@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+defaults_bin=/usr/bin/defaults
+plutil_bin=/usr/bin/plutil
+state_root="${BROWSER_PRIVACY_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/browser-privacy-macos}"
+firefox_policy_source="${BROWSER_PRIVACY_FIREFOX_POLICY_SOURCE:-$HOME/.local/share/browser-privacy-macos/firefox-policies.json}"
+
+shared_chromium_policies=(
+  'bool|AlternateErrorPagesEnabled|false'
+  'bool|BlockThirdPartyCookies|true'
+  'int|NetworkPredictionOptions|2'
+  'int|SafeBrowsingProtectionLevel|1'
+  'bool|SearchSuggestEnabled|false'
+  'bool|SpellCheckServiceEnabled|false'
+  'bool|UrlKeyedAnonymizedDataCollectionEnabled|false'
+  'string|WebRtcIPHandling|disable_non_proxied_udp'
+)
+
+brave_policies=(
+  'bool|MetricsReportingEnabled|false'
+  'bool|BraveAIChatEnabled|false'
+  'bool|BraveNewsDisabled|true'
+  'bool|BraveP3AEnabled|false'
+  'bool|BraveRewardsDisabled|true'
+  'bool|BraveStatsPingEnabled|false'
+  'bool|BraveTalkDisabled|true'
+  'bool|BraveVPNDisabled|true'
+  'bool|BraveWalletDisabled|true'
+  'bool|BraveWebDiscoveryEnabled|false'
+  'bool|BraveDeAmpEnabled|true'
+  'bool|BraveDebouncingEnabled|true'
+  'bool|BraveGlobalPrivacyControlEnabled|true'
+  'bool|BraveReduceLanguageEnabled|true'
+  'bool|BraveTrackingQueryParametersFilteringEnabled|true'
+  'int|DefaultBraveAdblockSetting|2'
+  'int|DefaultBraveFingerprintingV2Setting|3'
+  'int|DefaultBraveHttpsUpgradeSetting|2'
+  'int|DefaultBraveReferrersSetting|2'
+  'int|DefaultBraveRemember1PStorageSetting|2'
+)
+
+chrome_policies=(
+  'int|DefaultCookiesSetting|4'
+  'int|GeminiSettings|1'
+  'string|HttpsOnlyMode|force_enabled'
+)
+
+usage() {
+  echo "Usage: ${0##*/} <brave|chrome|firefox> <apply|status|remove>" >&2
+}
+
+expected_value() {
+  case "$1:$2" in
+    bool:true) echo 1 ;;
+    bool:false) echo 0 ;;
+    *) echo "$2" ;;
+  esac
+}
+
+ensure_state_root() {
+  mkdir -p "$state_root"
+  chmod 700 "$state_root"
+}
+
+select_chromium_browser() {
+  case "$1" in
+    brave)
+      browser_id=brave
+      browser_name=Brave
+      domain=com.brave.Browser
+      policies=("${shared_chromium_policies[@]}" "${brave_policies[@]}")
+      ;;
+    chrome)
+      browser_id=chrome
+      browser_name=Chrome
+      domain=com.google.Chrome
+      policies=("${shared_chromium_policies[@]}" "${chrome_policies[@]}")
+      ;;
+  esac
+  chromium_backup_file="$state_root/$browser_id.plist"
+}
+
+backup_chromium_preferences() {
+  local temporary
+
+  [[ ! -e "$chromium_backup_file" ]] || return 0
+  ensure_state_root
+  temporary=$(mktemp "$state_root/.${browser_id}.XXXXXX")
+  if ! "$defaults_bin" export "$domain" - > "$temporary" 2>/dev/null; then
+    "$plutil_bin" -create xml1 "$temporary"
+  fi
+  "$plutil_bin" -lint "$temporary" >/dev/null
+  chmod 600 "$temporary"
+  mv "$temporary" "$chromium_backup_file"
+}
+
+apply_chromium_policies() {
+  local policy type key value actual expected
+
+  backup_chromium_preferences
+  for policy in "${policies[@]}"; do
+    IFS='|' read -r type key value <<< "$policy"
+    "$defaults_bin" write "$domain" "$key" "-$type" "$value"
+    actual=$("$defaults_bin" read "$domain" "$key")
+    expected=$(expected_value "$type" "$value")
+    if [[ "$actual" != "$expected" ]]; then
+      echo "Failed to set $key: expected $expected, got $actual" >&2
+      exit 1
+    fi
+  done
+
+  echo "Applied ${#policies[@]} $browser_name policies. Fully quit and reopen $browser_name, then check its policy page."
+  if [[ "$browser_name" == Chrome ]]; then
+    echo "Chrome blocks its metrics policy at current-user scope, so telemetry remains controlled in Chrome Settings."
+  fi
+}
+
+show_chromium_status() {
+  local policy type key value actual expected drift=0
+
+  if [[ ! -f "$chromium_backup_file" ]]; then
+    echo "unsafe   backup missing: $chromium_backup_file"
+    drift=1
+  fi
+
+  for policy in "${policies[@]}"; do
+    IFS='|' read -r type key value <<< "$policy"
+    expected=$(expected_value "$type" "$value")
+    if actual=$("$defaults_bin" read "$domain" "$key" 2>/dev/null); then
+      if [[ "$actual" == "$expected" ]]; then
+        printf 'ok       %s=%s\n' "$key" "$actual"
+      else
+        printf 'changed  %s=%s (expected %s)\n' "$key" "$actual" "$expected"
+        drift=1
+      fi
+    else
+      printf 'unset    %s\n' "$key"
+      drift=1
+    fi
+  done
+
+  return "$drift"
+}
+
+restore_chromium_policy() {
+  local type=$1 key=$2 previous actual expected
+
+  if previous=$("$plutil_bin" -extract "$key" raw -o - "$chromium_backup_file" 2>/dev/null); then
+    "$defaults_bin" write "$domain" "$key" "-$type" "$previous"
+    actual=$("$defaults_bin" read "$domain" "$key")
+    expected=$(expected_value "$type" "$previous")
+    [[ "$actual" == "$expected" ]] || {
+      echo "Failed to restore $key: expected $expected, got $actual" >&2
+      return 1
+    }
+  else
+    "$defaults_bin" delete "$domain" "$key" 2>/dev/null || true
+    if "$defaults_bin" read "$domain" "$key" >/dev/null 2>&1; then
+      echo "Failed to remove $key" >&2
+      return 1
+    fi
+  fi
+}
+
+remove_chromium_policies() {
+  local policy type key value failed=0
+
+  [[ -f "$chromium_backup_file" ]] || {
+    echo "No backup found; refusing to remove policies that may predate this tool." >&2
+    exit 1
+  }
+
+  for policy in "${policies[@]}"; do
+    IFS='|' read -r type key value <<< "$policy"
+    restore_chromium_policy "$type" "$key" || failed=1
+  done
+
+  (( failed == 0 )) || exit 1
+  rm "$chromium_backup_file"
+  rmdir "$state_root" 2>/dev/null || true
+  echo "Restored the previous $browser_name policy values. Fully quit and reopen $browser_name."
+}
+
+find_firefox_app() {
+  local app
+
+  if [[ -n "${BROWSER_PRIVACY_FIREFOX_APP:-}" ]]; then
+    [[ -d "$BROWSER_PRIVACY_FIREFOX_APP" ]] || {
+      echo "Firefox app not found: $BROWSER_PRIVACY_FIREFOX_APP" >&2
+      return 1
+    }
+    echo "$BROWSER_PRIVACY_FIREFOX_APP"
+    return 0
+  fi
+
+  for app in "/Applications/Firefox.app" "$HOME/Applications/Firefox.app"; do
+    if [[ -d "$app" ]]; then
+      echo "$app"
+      return 0
+    fi
+  done
+
+  echo "Firefox.app not found" >&2
+  return 1
+}
+
+set_firefox_paths() {
+  firefox_app=$(find_firefox_app)
+  firefox_policy_target="$firefox_app/Contents/Resources/distribution/policies.json"
+  firefox_backup_dir="$state_root/firefox"
+}
+
+owns_firefox_policy() {
+  [[ -L "$firefox_policy_target" ]] || return 1
+  [[ "$(readlink "$firefox_policy_target")" == "$firefox_policy_source" ]]
+}
+
+validate_firefox_policy() {
+  [[ -r "$firefox_policy_source" ]] || {
+    echo "Firefox policy source not found: $firefox_policy_source" >&2
+    return 1
+  }
+  "$plutil_bin" -convert xml1 -o /dev/null -- "$firefox_policy_source"
+}
+
+backup_firefox_policy() {
+  local temporary kind
+
+  [[ ! -d "$firefox_backup_dir" ]] || return 1
+  ensure_state_root
+  temporary=$(mktemp -d "$state_root/.firefox.XXXXXX")
+
+  if [[ -L "$firefox_policy_target" ]]; then
+    kind='symlink'
+    readlink "$firefox_policy_target" > "$temporary/target"
+  elif [[ -f "$firefox_policy_target" ]]; then
+    kind='file'
+    cp -p "$firefox_policy_target" "$temporary/policies.json"
+  elif [[ -e "$firefox_policy_target" ]]; then
+    rm -rf "$temporary"
+    echo "Unsupported existing Firefox policy path: $firefox_policy_target" >&2
+    return 1
+  else
+    kind='absent'
+  fi
+
+  printf '%s\n' "$kind" > "$temporary/kind"
+  chmod -R go-rwx "$temporary"
+  mv "$temporary" "$firefox_backup_dir"
+}
+
+apply_firefox_policy() {
+  local first_apply=0
+
+  set_firefox_paths
+  validate_firefox_policy
+  if [[ ! -d "$firefox_backup_dir" ]]; then
+    backup_firefox_policy
+    first_apply=1
+  fi
+
+  if [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
+    if ! owns_firefox_policy; then
+      if (( first_apply )); then
+        rm "$firefox_policy_target"
+      else
+        echo "Refusing to replace a Firefox policy changed after the backup was created." >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  mkdir -p "${firefox_policy_target%/*}"
+  if [[ ! -L "$firefox_policy_target" ]]; then
+    ln -s "$firefox_policy_source" "$firefox_policy_target"
+  fi
+  owns_firefox_policy || {
+    echo "Firefox policy verification failed" >&2
+    exit 1
+  }
+  echo "Applied Firefox policies. Fully quit and reopen Firefox, then check about:policies."
+}
+
+show_firefox_status() {
+  local drift=0
+
+  set_firefox_paths
+  if ! validate_firefox_policy >/dev/null 2>&1; then
+    echo "changed  $firefox_policy_source"
+    drift=1
+  fi
+  if [[ ! -d "$firefox_backup_dir" ]]; then
+    echo "unsafe   backup missing: $firefox_backup_dir"
+    drift=1
+  fi
+  if owns_firefox_policy; then
+    echo "ok       $firefox_policy_target"
+  elif [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
+    echo "changed  $firefox_policy_target"
+    drift=1
+  else
+    echo "unset    $firefox_policy_target"
+    drift=1
+  fi
+
+  return "$drift"
+}
+
+restore_firefox_policy() {
+  local kind target
+
+  kind=$(<"$firefox_backup_dir/kind")
+  case "$kind" in
+    absent)
+      [[ ! -e "$firefox_policy_target" && ! -L "$firefox_policy_target" ]]
+      ;;
+    file)
+      mkdir -p "${firefox_policy_target%/*}"
+      cp -p "$firefox_backup_dir/policies.json" "$firefox_policy_target"
+      cmp -s "$firefox_backup_dir/policies.json" "$firefox_policy_target"
+      ;;
+    symlink)
+      target=$(<"$firefox_backup_dir/target")
+      mkdir -p "${firefox_policy_target%/*}"
+      ln -s "$target" "$firefox_policy_target"
+      [[ "$(readlink "$firefox_policy_target")" == "$target" ]]
+      ;;
+    *)
+      echo "Unknown Firefox backup type: $kind" >&2
+      return 1
+      ;;
+  esac
+}
+
+remove_firefox_policy() {
+  set_firefox_paths
+  [[ -d "$firefox_backup_dir" ]] || {
+    echo "No backup found; refusing to remove a Firefox policy that may predate this tool." >&2
+    exit 1
+  }
+
+  if [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
+    owns_firefox_policy || {
+      echo "Refusing to remove a Firefox policy changed after the backup was created." >&2
+      exit 1
+    }
+    rm "$firefox_policy_target"
+  fi
+
+  restore_firefox_policy || {
+    echo "Failed to restore the previous Firefox policy" >&2
+    exit 1
+  }
+  rm -rf "$firefox_backup_dir"
+  rmdir "$state_root" 2>/dev/null || true
+  echo "Restored the previous Firefox policy. Fully quit and reopen Firefox."
+}
+
+main() {
+  [[ "$(uname -s)" == Darwin ]] || {
+    echo "${0##*/}: macOS only" >&2
+    exit 1
+  }
+
+  if [[ "${0##*/}" == brave-harden ]]; then
+    set -- brave "$@"
+  fi
+  [[ $# -eq 2 ]] || { usage; exit 2; }
+
+  local browser=$1 action=$2
+  case "$browser" in
+    brave|chrome)
+      select_chromium_browser "$browser"
+      case "$action" in
+        apply) apply_chromium_policies ;;
+        status) show_chromium_status ;;
+        remove) remove_chromium_policies ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    firefox)
+      case "$action" in
+        apply) apply_firefox_policy ;;
+        status) show_firefox_status ;;
+        remove) remove_firefox_policy ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
