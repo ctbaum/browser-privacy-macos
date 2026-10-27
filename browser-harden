@@ -5,6 +5,7 @@ defaults_bin=/usr/bin/defaults
 plutil_bin=/usr/bin/plutil
 state_root="${BROWSER_PRIVACY_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/browser-privacy-macos}"
 firefox_policy_source="${BROWSER_PRIVACY_FIREFOX_POLICY_SOURCE:-$HOME/.local/share/browser-privacy-macos/firefox-policies.json}"
+firefox_minimum_major=158
 
 shared_chromium_policies=(
   'bool|AlternateErrorPagesEnabled|false'
@@ -58,9 +59,16 @@ expected_value() {
   esac
 }
 
+expected_defaults_type() {
+  case "$1" in
+    bool) echo 'Type is boolean' ;;
+    int) echo 'Type is integer' ;;
+    string) echo 'Type is string' ;;
+  esac
+}
+
 ensure_state_root() {
-  mkdir -p "$state_root"
-  chmod 700 "$state_root"
+  mkdir -p "$state_root" && chmod 700 "$state_root"
 }
 
 select_chromium_browser() {
@@ -81,34 +89,453 @@ select_chromium_browser() {
   chromium_backup_file="$state_root/$browser_id.plist"
 }
 
-backup_chromium_preferences() {
-  local temporary
+plist_is_dictionary() {
+  local json
 
-  [[ ! -e "$chromium_backup_file" ]] || return 0
-  ensure_state_root
-  temporary=$(mktemp "$state_root/.${browser_id}.XXXXXX")
-  if ! "$defaults_bin" export "$domain" - > "$temporary" 2>/dev/null; then
-    "$plutil_bin" -create xml1 "$temporary"
+  json=$("$plutil_bin" -convert json -o - -- "$1" 2>/dev/null) || return 1
+  json="${json#"${json%%[![:space:]]*}"}"
+  [[ "${json:0:1}" == '{' ]]
+}
+
+plist_dictionary_is_empty() {
+  local json
+
+  json=$("$plutil_bin" -convert json -o - -- "$1" 2>/dev/null) || return 1
+  json=${json//[[:space:]]/}
+  [[ "$json" == '{}' ]]
+}
+
+chromium_domain_exists() {
+  local domains listed
+  local -a domain_list
+
+  domains=$("$defaults_bin" domains 2>/dev/null) || return 2
+  IFS=',' read -r -a domain_list <<< "$domains"
+  for listed in "${domain_list[@]}"; do
+    listed="${listed#"${listed%%[![:space:]]*}"}"
+    listed="${listed%"${listed##*[![:space:]]}"}"
+    [[ "$listed" == "$domain" ]] && return 0
+  done
+  return 1
+}
+
+export_chromium_domain() {
+  local output=$1 status
+
+  rm -f "$output"
+  if "$defaults_bin" export "$domain" "$output" >/dev/null 2>&1; then
+    if "$plutil_bin" -lint "$output" >/dev/null 2>&1 && plist_is_dictionary "$output"; then
+      return 0
+    fi
+    echo "Failed to read a valid $domain preference domain." >&2
+    return 1
   fi
-  "$plutil_bin" -lint "$temporary" >/dev/null
-  chmod 600 "$temporary"
-  mv "$temporary" "$chromium_backup_file"
+
+  if chromium_domain_exists; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0)
+      echo "Failed to export existing $domain preferences; refusing to create a backup." >&2
+      return 1
+      ;;
+    1)
+      rm -f "$output"
+      "$plutil_bin" -create xml1 "$output" || return 1
+      ;;
+    *)
+      echo "Could not determine whether $domain exists; refusing to create a backup." >&2
+      return 1
+      ;;
+  esac
+}
+
+initialize_chromium_backup() {
+  local backup=$1
+
+  "$plutil_bin" -create xml1 "$backup" &&
+    "$plutil_bin" -insert format -string browser-privacy-macos-chromium-v1 "$backup" &&
+    "$plutil_bin" -insert domain -string "$domain" "$backup" &&
+    "$plutil_bin" -insert manifest -array "$backup" &&
+    "$plutil_bin" -insert entries -dictionary "$backup"
+}
+
+validate_chromium_backup_at() {
+  local backup=$1 saved_domain count entries entry_count=0 index key entry_path state saved_type value_type
+  local seen=$'\n'
+
+  [[ -f "$backup" && ! -L "$backup" && -r "$backup" ]] || return 1
+  "$plutil_bin" -lint "$backup" >/dev/null 2>&1 || return 1
+  [[ "$("$plutil_bin" -type format "$backup" 2>/dev/null)" == string ]] || return 1
+  [[ "$("$plutil_bin" -extract format raw -o - "$backup" 2>/dev/null)" == browser-privacy-macos-chromium-v1 ]] ||
+    return 1
+  [[ "$("$plutil_bin" -type domain "$backup" 2>/dev/null)" == string ]] || return 1
+  saved_domain=$("$plutil_bin" -extract domain raw -o - "$backup" 2>/dev/null) || return 1
+  [[ "$saved_domain" == "$domain" ]] || return 1
+  [[ "$("$plutil_bin" -type manifest "$backup" 2>/dev/null)" == array ]] || return 1
+  [[ "$("$plutil_bin" -type entries "$backup" 2>/dev/null)" == dictionary ]] || return 1
+  count=$("$plutil_bin" -extract manifest raw -o - "$backup" 2>/dev/null) || return 1
+  [[ -n "$count" && "$count" != *[!0-9]* ]] || return 1
+  (( count > 0 )) || return 1
+  entries=$("$plutil_bin" -extract entries raw -o - "$backup" 2>/dev/null) || return 1
+  if [[ -n "$entries" ]]; then
+    while IFS= read -r key; do
+      (( entry_count += 1 ))
+    done <<< "$entries"
+  fi
+  (( entry_count == count )) || return 1
+
+  for ((index = 0; index < count; index += 1)); do
+    key=$("$plutil_bin" -extract "manifest.$index" raw -o - "$backup" 2>/dev/null) || return 1
+    [[ -n "$key" && "$key" != *[!A-Za-z0-9_-]* ]] || return 1
+    case "$seen" in
+      *$'\n'"$key"$'\n'*) return 1 ;;
+    esac
+    seen="${seen}${key}"$'\n'
+    entry_path="entries.$key"
+    [[ "$("$plutil_bin" -type "$entry_path" "$backup" 2>/dev/null)" == dictionary ]] || return 1
+    [[ "$("$plutil_bin" -type "$entry_path.state" "$backup" 2>/dev/null)" == string ]] || return 1
+    state=$("$plutil_bin" -extract "$entry_path.state" raw -o - "$backup" 2>/dev/null) || return 1
+    case "$state" in
+      present)
+        [[ "$("$plutil_bin" -type "$entry_path.type" "$backup" 2>/dev/null)" == string ]] || return 1
+        saved_type=$("$plutil_bin" -extract "$entry_path.type" raw -o - "$backup" 2>/dev/null) || return 1
+        value_type=$("$plutil_bin" -type "$entry_path.value" "$backup" 2>/dev/null) || return 1
+        [[ "$saved_type" == "$value_type" ]] || return 1
+        ;;
+      absent)
+        ! "$plutil_bin" -type "$entry_path.type" "$backup" >/dev/null 2>&1 || return 1
+        ! "$plutil_bin" -type "$entry_path.value" "$backup" >/dev/null 2>&1 || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+validate_chromium_backup() {
+  validate_chromium_backup_at "$chromium_backup_file"
+}
+
+chromium_backup_has_key() {
+  "$plutil_bin" -type "entries.$1" "$chromium_backup_file" >/dev/null 2>&1
+}
+
+add_chromium_backup_entry() {
+  local backup=$1 snapshot=$2 key=$3 type value_xml entry_path="entries.$3"
+
+  "$plutil_bin" -insert "$entry_path" -dictionary "$backup" || return 1
+  if type=$("$plutil_bin" -type "$key" "$snapshot" 2>/dev/null); then
+    value_xml=$("$plutil_bin" -extract "$key" xml1 -o - "$snapshot") || return 1
+    "$plutil_bin" -insert "$entry_path.state" -string present "$backup" || return 1
+    "$plutil_bin" -insert "$entry_path.type" -string "$type" "$backup" || return 1
+    "$plutil_bin" -insert "$entry_path.value" -xml "$value_xml" "$backup" || return 1
+  else
+    "$plutil_bin" -insert "$entry_path.state" -string absent "$backup" || return 1
+  fi
+  "$plutil_bin" -insert manifest -string "$key" -append "$backup"
+}
+
+prepare_chromium_backup() {
+  local snapshot=$1 policy type key value temporary candidate had_backup=0
+  local -a missing=()
+
+  chromium_backup_previous_count=0
+  if [[ -e "$chromium_backup_file" || -L "$chromium_backup_file" ]]; then
+    if ! validate_chromium_backup; then
+      echo "Chromium backup is unreadable, damaged, or from an unsupported older format: $chromium_backup_file" >&2
+      return 1
+    fi
+    chromium_backup_previous_count=$("$plutil_bin" -extract manifest raw -o - "$chromium_backup_file") || return 1
+    had_backup=1
+  fi
+
+  for policy in "${policies[@]}"; do
+    IFS='|' read -r type key value <<< "$policy"
+    if (( ! had_backup )) || ! chromium_backup_has_key "$key"; then
+      missing+=("$key")
+    fi
+  done
+  (( ${#missing[@]} > 0 )) || return 0
+
+  ensure_state_root || return 1
+  temporary=$(mktemp -d "$state_root/.${browser_id}.XXXXXX") || return 1
+  candidate="$temporary/backup.plist"
+  if (( had_backup )); then
+    if ! cp -p "$chromium_backup_file" "$candidate"; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  elif ! initialize_chromium_backup "$candidate"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+
+  for key in "${missing[@]}"; do
+    if ! add_chromium_backup_entry "$candidate" "$snapshot" "$key"; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  done
+  chmod 600 "$candidate" || { rm -rf "$temporary"; return 1; }
+  if ! validate_chromium_backup_at "$candidate" || ! mv "$candidate" "$chromium_backup_file"; then
+    rm -rf "$temporary"
+    echo "Failed to create a valid Chromium backup: $chromium_backup_file" >&2
+    return 1
+  fi
+  rmdir "$temporary" 2>/dev/null || true
+}
+
+trim_chromium_backup() {
+  local keep_count=$1 current_count index key temporary candidate
+
+  current_count=$("$plutil_bin" -extract manifest raw -o - "$chromium_backup_file") || return 1
+  (( current_count > keep_count )) || return 0
+  if (( keep_count == 0 )); then
+    rm "$chromium_backup_file"
+    return
+  fi
+
+  temporary=$(mktemp -d "$state_root/.${browser_id}-trim.XXXXXX") || return 1
+  candidate="$temporary/backup.plist"
+  cp -p "$chromium_backup_file" "$candidate" || { rm -rf "$temporary"; return 1; }
+  for ((index = current_count - 1; index >= keep_count; index -= 1)); do
+    key=$("$plutil_bin" -extract "manifest.$index" raw -o - "$candidate") || { rm -rf "$temporary"; return 1; }
+    "$plutil_bin" -remove "entries.$key" "$candidate" || { rm -rf "$temporary"; return 1; }
+    "$plutil_bin" -remove "manifest.$index" "$candidate" || { rm -rf "$temporary"; return 1; }
+  done
+  chmod 600 "$candidate" || { rm -rf "$temporary"; return 1; }
+  validate_chromium_backup_at "$candidate" || { rm -rf "$temporary"; return 1; }
+  mv "$candidate" "$chromium_backup_file" || { rm -rf "$temporary"; return 1; }
+  rmdir "$temporary" 2>/dev/null || true
+}
+
+copy_plist_value() {
+  local source=$1 source_path=$2 target=$3 target_path=$4 value_xml
+
+  value_xml=$("$plutil_bin" -extract "$source_path" xml1 -o - "$source") || return 1
+  if "$plutil_bin" -type "$target_path" "$target" >/dev/null 2>&1; then
+    "$plutil_bin" -replace "$target_path" -xml "$value_xml" "$target"
+  else
+    "$plutil_bin" -insert "$target_path" -xml "$value_xml" "$target"
+  fi
+}
+
+write_chromium_domain() {
+  local source=$1 status key
+  shift
+
+  if plist_dictionary_is_empty "$source"; then
+    if "$defaults_bin" delete "$domain" >/dev/null 2>&1; then
+      return 0
+    fi
+    if chromium_domain_exists; then
+      status=0
+    else
+      status=$?
+    fi
+    [[ "$status" == 1 ]]
+    return
+  fi
+
+  "$defaults_bin" import "$domain" "$source" >/dev/null || return 1
+  for key in "$@"; do
+    if "$plutil_bin" -type "$key" "$source" >/dev/null 2>&1; then
+      continue
+    fi
+    "$defaults_bin" delete "$domain" "$key" >/dev/null 2>&1 ||
+      ! "$defaults_bin" read "$domain" "$key" >/dev/null 2>&1 || return 1
+  done
+}
+
+compare_plist_values() {
+  local first=$1 first_path=$2 second=$3 second_path=$4 temporary=$5
+
+  rm -f "$temporary/first-value.plist" "$temporary/second-value.plist"
+  "$plutil_bin" -extract "$first_path" binary1 -o "$temporary/first-value.plist" "$first" || return 1
+  "$plutil_bin" -extract "$second_path" binary1 -o "$temporary/second-value.plist" "$second" || return 1
+  cmp -s "$temporary/first-value.plist" "$temporary/second-value.plist"
+}
+
+restore_chromium_keys_from_snapshot() {
+  local snapshot=$1 temporary current desired actual key expected_type actual_type
+  local -a delete_keys=()
+  shift
+
+  ensure_state_root || return 1
+  temporary=$(mktemp -d "$state_root/.${browser_id}-rollback.XXXXXX") || return 1
+  current="$temporary/current.plist"
+  desired="$temporary/desired.plist"
+  actual="$temporary/actual.plist"
+  if ! export_chromium_domain "$current" || ! cp "$current" "$desired"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+
+  for key in "$@"; do
+    if "$plutil_bin" -type "$key" "$snapshot" >/dev/null 2>&1; then
+      if ! copy_plist_value "$snapshot" "$key" "$desired" "$key"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+    else
+      delete_keys+=("$key")
+      if "$plutil_bin" -type "$key" "$desired" >/dev/null 2>&1; then
+        "$plutil_bin" -remove "$key" "$desired" || { rm -rf "$temporary"; return 1; }
+      fi
+    fi
+  done
+
+  if (( ${#delete_keys[@]} > 0 )); then
+    write_chromium_domain "$desired" "${delete_keys[@]}" || { rm -rf "$temporary"; return 1; }
+  else
+    write_chromium_domain "$desired" || { rm -rf "$temporary"; return 1; }
+  fi
+  if ! export_chromium_domain "$actual"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+  for key in "$@"; do
+    if expected_type=$("$plutil_bin" -type "$key" "$snapshot" 2>/dev/null); then
+      actual_type=$("$plutil_bin" -type "$key" "$actual" 2>/dev/null) || { rm -rf "$temporary"; return 1; }
+      if [[ "$actual_type" != "$expected_type" ]] ||
+        ! compare_plist_values "$snapshot" "$key" "$actual" "$key" "$temporary"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+    elif "$plutil_bin" -type "$key" "$actual" >/dev/null 2>&1; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  done
+  rm -rf "$temporary"
+}
+
+restore_chromium_backup() {
+  local temporary current desired actual count index key entry_path state expected_type actual_type
+  local -a delete_keys=()
+
+  validate_chromium_backup || return 1
+  ensure_state_root || return 1
+  temporary=$(mktemp -d "$state_root/.${browser_id}-restore.XXXXXX") || return 1
+  current="$temporary/current.plist"
+  desired="$temporary/desired.plist"
+  actual="$temporary/actual.plist"
+  if ! export_chromium_domain "$current" || ! cp "$current" "$desired"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+  count=$("$plutil_bin" -extract manifest raw -o - "$chromium_backup_file") || { rm -rf "$temporary"; return 1; }
+
+  for ((index = 0; index < count; index += 1)); do
+    key=$("$plutil_bin" -extract "manifest.$index" raw -o - "$chromium_backup_file") || {
+      rm -rf "$temporary"
+      return 1
+    }
+    entry_path="entries.$key"
+    state=$("$plutil_bin" -extract "$entry_path.state" raw -o - "$chromium_backup_file") || {
+      rm -rf "$temporary"
+      return 1
+    }
+    if [[ "$state" == present ]]; then
+      if ! copy_plist_value "$chromium_backup_file" "$entry_path.value" "$desired" "$key"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+    else
+      delete_keys+=("$key")
+      if "$plutil_bin" -type "$key" "$desired" >/dev/null 2>&1; then
+        "$plutil_bin" -remove "$key" "$desired" || { rm -rf "$temporary"; return 1; }
+      fi
+    fi
+  done
+
+  if (( ${#delete_keys[@]} > 0 )); then
+    write_chromium_domain "$desired" "${delete_keys[@]}" || { rm -rf "$temporary"; return 1; }
+  else
+    write_chromium_domain "$desired" || { rm -rf "$temporary"; return 1; }
+  fi
+  if ! export_chromium_domain "$actual"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+  for ((index = 0; index < count; index += 1)); do
+    key=$("$plutil_bin" -extract "manifest.$index" raw -o - "$chromium_backup_file") || {
+      rm -rf "$temporary"
+      return 1
+    }
+    entry_path="entries.$key"
+    state=$("$plutil_bin" -extract "$entry_path.state" raw -o - "$chromium_backup_file") || {
+      rm -rf "$temporary"
+      return 1
+    }
+    if [[ "$state" == present ]]; then
+      expected_type=$("$plutil_bin" -extract "$entry_path.type" raw -o - "$chromium_backup_file") || {
+        rm -rf "$temporary"
+        return 1
+      }
+      actual_type=$("$plutil_bin" -type "$key" "$actual" 2>/dev/null) || { rm -rf "$temporary"; return 1; }
+      if [[ "$actual_type" != "$expected_type" ]] ||
+        ! compare_plist_values "$chromium_backup_file" "$entry_path.value" "$actual" "$key" "$temporary"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+    elif "$plutil_bin" -type "$key" "$actual" >/dev/null 2>&1; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  done
+  rm -rf "$temporary"
 }
 
 apply_chromium_policies() {
-  local policy type key value actual expected
+  local policy type key value actual expected actual_type expected_type temporary snapshot failure=''
+  local -a changed_keys=()
 
-  backup_chromium_preferences
+  ensure_state_root || return 1
+  temporary=$(mktemp -d "$state_root/.${browser_id}-apply.XXXXXX") || return 1
+  snapshot="$temporary/domain.plist"
+  if ! export_chromium_domain "$snapshot" || ! prepare_chromium_backup "$snapshot"; then
+    rm -rf "$temporary"
+    rmdir "$state_root" 2>/dev/null || true
+    return 1
+  fi
+
   for policy in "${policies[@]}"; do
     IFS='|' read -r type key value <<< "$policy"
-    "$defaults_bin" write "$domain" "$key" "-$type" "$value"
-    actual=$("$defaults_bin" read "$domain" "$key")
+    changed_keys+=("$key")
     expected=$(expected_value "$type" "$value")
-    if [[ "$actual" != "$expected" ]]; then
-      echo "Failed to set $key: expected $expected, got $actual" >&2
-      exit 1
+    expected_type=$(expected_defaults_type "$type")
+    if ! "$defaults_bin" write "$domain" "$key" "-$type" "$value"; then
+      failure="Failed to set $key."
+      break
+    fi
+    if ! actual=$("$defaults_bin" read "$domain" "$key" 2>/dev/null) ||
+      ! actual_type=$("$defaults_bin" read-type "$domain" "$key" 2>/dev/null); then
+      failure="Failed to verify $key."
+      break
+    fi
+    if [[ "$actual" != "$expected" || "$actual_type" != "$expected_type" ]]; then
+      failure="Failed to set $key: expected $expected ($expected_type), got $actual ($actual_type)."
+      break
     fi
   done
+
+  if [[ -n "$failure" ]]; then
+    echo "$failure Restoring values changed by this apply." >&2
+    if restore_chromium_keys_from_snapshot "$snapshot" "${changed_keys[@]}"; then
+      if ! trim_chromium_backup "$chromium_backup_previous_count"; then
+        echo "Chromium settings were restored, but newly created backup entries could not be discarded." >&2
+      fi
+    else
+      echo "Automatic Chromium rollback failed; the original backup was kept at $chromium_backup_file." >&2
+    fi
+    rm -rf "$temporary"
+    rmdir "$state_root" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "$temporary"
 
   echo "Applied ${#policies[@]} $browser_name policies. Fully quit and reopen $browser_name, then check its policy page."
   if [[ "$browser_name" == Chrome ]]; then
@@ -117,21 +544,26 @@ apply_chromium_policies() {
 }
 
 show_chromium_status() {
-  local policy type key value actual expected drift=0
+  local policy type key value actual expected actual_type expected_type drift=0
 
-  if [[ ! -f "$chromium_backup_file" ]]; then
+  if [[ ! -e "$chromium_backup_file" && ! -L "$chromium_backup_file" ]]; then
     echo "unsafe   backup missing: $chromium_backup_file"
+    drift=1
+  elif ! validate_chromium_backup; then
+    echo "unsafe   backup unreadable or invalid: $chromium_backup_file"
     drift=1
   fi
 
   for policy in "${policies[@]}"; do
     IFS='|' read -r type key value <<< "$policy"
     expected=$(expected_value "$type" "$value")
-    if actual=$("$defaults_bin" read "$domain" "$key" 2>/dev/null); then
-      if [[ "$actual" == "$expected" ]]; then
+    expected_type=$(expected_defaults_type "$type")
+    if actual=$("$defaults_bin" read "$domain" "$key" 2>/dev/null) &&
+      actual_type=$("$defaults_bin" read-type "$domain" "$key" 2>/dev/null); then
+      if [[ "$actual" == "$expected" && "$actual_type" == "$expected_type" ]]; then
         printf 'ok       %s=%s\n' "$key" "$actual"
       else
-        printf 'changed  %s=%s (expected %s)\n' "$key" "$actual" "$expected"
+        printf 'changed  %s=%s (%s; expected %s, %s)\n' "$key" "$actual" "$actual_type" "$expected" "$expected_type"
         drift=1
       fi
     else
@@ -143,41 +575,21 @@ show_chromium_status() {
   return "$drift"
 }
 
-restore_chromium_policy() {
-  local type=$1 key=$2 previous actual expected
-
-  if previous=$("$plutil_bin" -extract "$key" raw -o - "$chromium_backup_file" 2>/dev/null); then
-    "$defaults_bin" write "$domain" "$key" "-$type" "$previous"
-    actual=$("$defaults_bin" read "$domain" "$key")
-    expected=$(expected_value "$type" "$previous")
-    [[ "$actual" == "$expected" ]] || {
-      echo "Failed to restore $key: expected $expected, got $actual" >&2
-      return 1
-    }
-  else
-    "$defaults_bin" delete "$domain" "$key" 2>/dev/null || true
-    if "$defaults_bin" read "$domain" "$key" >/dev/null 2>&1; then
-      echo "Failed to remove $key" >&2
-      return 1
-    fi
-  fi
-}
-
 remove_chromium_policies() {
-  local policy type key value failed=0
-
-  [[ -f "$chromium_backup_file" ]] || {
+  [[ -e "$chromium_backup_file" || -L "$chromium_backup_file" ]] || {
     echo "No backup found; refusing to remove policies that may predate this tool." >&2
-    exit 1
+    return 1
+  }
+  validate_chromium_backup || {
+    echo "Chromium backup is unreadable, damaged, or from an unsupported older format: $chromium_backup_file" >&2
+    return 1
+  }
+  restore_chromium_backup || {
+    echo "Failed to restore the previous $browser_name policy values; the backup was kept." >&2
+    return 1
   }
 
-  for policy in "${policies[@]}"; do
-    IFS='|' read -r type key value <<< "$policy"
-    restore_chromium_policy "$type" "$key" || failed=1
-  done
-
-  (( failed == 0 )) || exit 1
-  rm "$chromium_backup_file"
+  rm "$chromium_backup_file" || return 1
   rmdir "$state_root" 2>/dev/null || true
   echo "Restored the previous $browser_name policy values. Fully quit and reopen $browser_name."
 }
@@ -206,7 +618,10 @@ find_firefox_app() {
 }
 
 set_firefox_paths() {
-  firefox_app=$(find_firefox_app)
+  local found
+
+  found=$(find_firefox_app) || return 1
+  firefox_app=$(cd "$found" && pwd -P) || return 1
   firefox_policy_target="$firefox_app/Contents/Resources/distribution/policies.json"
   firefox_backup_dir="$state_root/firefox"
 }
@@ -214,6 +629,45 @@ set_firefox_paths() {
 owns_firefox_policy() {
   [[ -L "$firefox_policy_target" ]] || return 1
   [[ "$(readlink "$firefox_policy_target")" == "$firefox_policy_source" ]]
+}
+
+validate_firefox_version() {
+  local info_plist application_ini version major name value remoting_name=''
+
+  info_plist="$firefox_app/Contents/Info.plist"
+  application_ini="$firefox_app/Contents/Resources/application.ini"
+  version=$("$plutil_bin" -extract CFBundleShortVersionString raw -o - "$info_plist" 2>/dev/null) || {
+    echo "Could not read the Firefox version from $info_plist." >&2
+    return 1
+  }
+  [[ -r "$application_ini" ]] || {
+    echo "Could not identify the Firefox release channel from $application_ini." >&2
+    return 1
+  }
+  while IFS='=' read -r name value; do
+    if [[ "$name" == RemotingName ]]; then
+      remoting_name=$value
+      break
+    fi
+  done < "$application_ini"
+  [[ -n "$remoting_name" ]] || {
+    echo "Could not identify the Firefox release channel from $application_ini." >&2
+    return 1
+  }
+  if [[ "$remoting_name" == *esr* ]]; then
+    echo "Firefox ESR is not supported by this preset; use regular Firefox $firefox_minimum_major or newer." >&2
+    return 1
+  fi
+
+  major=${version%%.*}
+  [[ -n "$major" && "$major" != *[!0-9]* ]] || {
+    echo "Unsupported Firefox version: $version" >&2
+    return 1
+  }
+  if (( 10#$major < firefox_minimum_major )); then
+    echo "Firefox $firefox_minimum_major or newer is required; found $version." >&2
+    return 1
+  fi
 }
 
 validate_firefox_policy() {
@@ -224,19 +678,70 @@ validate_firefox_policy() {
   "$plutil_bin" -convert xml1 -o /dev/null -- "$firefox_policy_source"
 }
 
+validate_firefox_backup_at() {
+  local backup=$1 kind stored_app target
+
+  [[ -d "$backup" && ! -L "$backup" ]] || return 1
+  [[ -f "$backup/kind" && ! -L "$backup/kind" && -r "$backup/kind" ]] || return 1
+  [[ -f "$backup/app-path" && ! -L "$backup/app-path" && -r "$backup/app-path" ]] || return 1
+  kind=$(<"$backup/kind") || return 1
+  stored_app=$(<"$backup/app-path") || return 1
+  if [[ "$stored_app" != "$firefox_app" ]]; then
+    echo "Firefox backup belongs to $stored_app, not $firefox_app. Remove it from the original installation first." >&2
+    return 1
+  fi
+
+  case "$kind" in
+    absent) ;;
+    file)
+      [[ -f "$backup/policies.json" && ! -L "$backup/policies.json" && -r "$backup/policies.json" ]] || return 1
+      ;;
+    symlink)
+      [[ -f "$backup/target" && ! -L "$backup/target" && -r "$backup/target" ]] || return 1
+      target=$(<"$backup/target") || return 1
+      [[ -n "$target" ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_firefox_backup() {
+  validate_firefox_backup_at "$firefox_backup_dir"
+}
+
+firefox_target_matches_backup() {
+  local kind target
+
+  kind=$(<"$firefox_backup_dir/kind") || return 1
+  case "$kind" in
+    absent)
+      [[ ! -e "$firefox_policy_target" && ! -L "$firefox_policy_target" ]]
+      ;;
+    file)
+      [[ -f "$firefox_policy_target" && ! -L "$firefox_policy_target" ]] &&
+        cmp -s "$firefox_backup_dir/policies.json" "$firefox_policy_target"
+      ;;
+    symlink)
+      [[ -L "$firefox_policy_target" ]] || return 1
+      target=$(<"$firefox_backup_dir/target") || return 1
+      [[ "$(readlink "$firefox_policy_target")" == "$target" ]]
+      ;;
+  esac
+}
+
 backup_firefox_policy() {
   local temporary kind
 
-  [[ ! -d "$firefox_backup_dir" ]] || return 1
-  ensure_state_root
-  temporary=$(mktemp -d "$state_root/.firefox.XXXXXX")
+  [[ ! -e "$firefox_backup_dir" && ! -L "$firefox_backup_dir" ]] || return 1
+  ensure_state_root || return 1
+  temporary=$(mktemp -d "$state_root/.firefox.XXXXXX") || return 1
 
   if [[ -L "$firefox_policy_target" ]]; then
     kind='symlink'
-    readlink "$firefox_policy_target" > "$temporary/target"
+    readlink "$firefox_policy_target" > "$temporary/target" || { rm -rf "$temporary"; return 1; }
   elif [[ -f "$firefox_policy_target" ]]; then
     kind='file'
-    cp -p "$firefox_policy_target" "$temporary/policies.json"
+    cp -p "$firefox_policy_target" "$temporary/policies.json" || { rm -rf "$temporary"; return 1; }
   elif [[ -e "$firefox_policy_target" ]]; then
     rm -rf "$temporary"
     echo "Unsupported existing Firefox policy path: $firefox_policy_target" >&2
@@ -245,39 +750,56 @@ backup_firefox_policy() {
     kind='absent'
   fi
 
-  printf '%s\n' "$kind" > "$temporary/kind"
-  chmod -R go-rwx "$temporary"
-  mv "$temporary" "$firefox_backup_dir"
+  printf '%s\n' "$kind" > "$temporary/kind" || { rm -rf "$temporary"; return 1; }
+  printf '%s\n' "$firefox_app" > "$temporary/app-path" || { rm -rf "$temporary"; return 1; }
+  chmod -R go-rwx "$temporary" || { rm -rf "$temporary"; return 1; }
+  if ! validate_firefox_backup_at "$temporary" || ! mv "$temporary" "$firefox_backup_dir"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+}
+
+install_firefox_policy_link() {
+  local target_dir temporary
+
+  target_dir=${firefox_policy_target%/*}
+  mkdir -p "$target_dir" || return 1
+  temporary=$(mktemp -d "$target_dir/.browser-privacy.XXXXXX") || return 1
+  if ! ln -s "$firefox_policy_source" "$temporary/policies.json" ||
+    ! mv -f "$temporary/policies.json" "$firefox_policy_target"; then
+    rm -rf "$temporary"
+    return 1
+  fi
+  rmdir "$temporary" 2>/dev/null || true
 }
 
 apply_firefox_policy() {
-  local first_apply=0
+  set_firefox_paths || return 1
+  validate_firefox_version || return 1
+  validate_firefox_policy || return 1
 
-  set_firefox_paths
-  validate_firefox_policy
-  if [[ ! -d "$firefox_backup_dir" ]]; then
-    backup_firefox_policy
-    first_apply=1
+  if [[ -e "$firefox_backup_dir" || -L "$firefox_backup_dir" ]]; then
+    validate_firefox_backup || {
+      echo "Firefox backup is unreadable, invalid, or belongs to another application path." >&2
+      return 1
+    }
+  else
+    backup_firefox_policy || return 1
   fi
 
-  if [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
-    if ! owns_firefox_policy; then
-      if (( first_apply )); then
-        rm "$firefox_policy_target"
-      else
-        echo "Refusing to replace a Firefox policy changed after the backup was created." >&2
-        exit 1
-      fi
-    fi
-  fi
-
-  mkdir -p "${firefox_policy_target%/*}"
-  if [[ ! -L "$firefox_policy_target" ]]; then
-    ln -s "$firefox_policy_source" "$firefox_policy_target"
+  if ! owns_firefox_policy; then
+    firefox_target_matches_backup || {
+      echo "Refusing to replace a Firefox policy changed after the backup was created." >&2
+      return 1
+    }
+    install_firefox_policy_link || {
+      echo "Failed to install the Firefox policy link." >&2
+      return 1
+    }
   fi
   owns_firefox_policy || {
     echo "Firefox policy verification failed" >&2
-    exit 1
+    return 1
   }
   echo "Applied Firefox policies. Fully quit and reopen Firefox, then check about:policies."
 }
@@ -285,13 +807,20 @@ apply_firefox_policy() {
 show_firefox_status() {
   local drift=0
 
-  set_firefox_paths
+  set_firefox_paths || return 1
+  if ! validate_firefox_version; then
+    echo "unsupported $firefox_app"
+    drift=1
+  fi
   if ! validate_firefox_policy >/dev/null 2>&1; then
     echo "changed  $firefox_policy_source"
     drift=1
   fi
-  if [[ ! -d "$firefox_backup_dir" ]]; then
+  if [[ ! -e "$firefox_backup_dir" && ! -L "$firefox_backup_dir" ]]; then
     echo "unsafe   backup missing: $firefox_backup_dir"
+    drift=1
+  elif ! validate_firefox_backup; then
+    echo "unsafe   backup unreadable or invalid: $firefox_backup_dir"
     drift=1
   fi
   if owns_firefox_policy; then
@@ -308,51 +837,67 @@ show_firefox_status() {
 }
 
 restore_firefox_policy() {
-  local kind target
+  local kind target target_dir temporary
 
-  kind=$(<"$firefox_backup_dir/kind")
+  kind=$(<"$firefox_backup_dir/kind") || return 1
   case "$kind" in
     absent)
+      if [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
+        rm "$firefox_policy_target" || return 1
+      fi
       [[ ! -e "$firefox_policy_target" && ! -L "$firefox_policy_target" ]]
       ;;
     file)
-      mkdir -p "${firefox_policy_target%/*}"
-      cp -p "$firefox_backup_dir/policies.json" "$firefox_policy_target"
-      cmp -s "$firefox_backup_dir/policies.json" "$firefox_policy_target"
+      target_dir=${firefox_policy_target%/*}
+      mkdir -p "$target_dir" || return 1
+      temporary=$(mktemp -d "$target_dir/.browser-privacy.XXXXXX") || return 1
+      if ! cp -p "$firefox_backup_dir/policies.json" "$temporary/policies.json" ||
+        ! mv -f "$temporary/policies.json" "$firefox_policy_target"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+      rmdir "$temporary" 2>/dev/null || true
+      [[ -f "$firefox_policy_target" && ! -L "$firefox_policy_target" ]] &&
+        cmp -s "$firefox_backup_dir/policies.json" "$firefox_policy_target"
       ;;
     symlink)
-      target=$(<"$firefox_backup_dir/target")
-      mkdir -p "${firefox_policy_target%/*}"
-      ln -s "$target" "$firefox_policy_target"
-      [[ "$(readlink "$firefox_policy_target")" == "$target" ]]
-      ;;
-    *)
-      echo "Unknown Firefox backup type: $kind" >&2
-      return 1
+      target=$(<"$firefox_backup_dir/target") || return 1
+      target_dir=${firefox_policy_target%/*}
+      mkdir -p "$target_dir" || return 1
+      temporary=$(mktemp -d "$target_dir/.browser-privacy.XXXXXX") || return 1
+      if ! ln -s "$target" "$temporary/policies.json" ||
+        ! mv -f "$temporary/policies.json" "$firefox_policy_target"; then
+        rm -rf "$temporary"
+        return 1
+      fi
+      rmdir "$temporary" 2>/dev/null || true
+      [[ -L "$firefox_policy_target" && "$(readlink "$firefox_policy_target")" == "$target" ]]
       ;;
   esac
 }
 
 remove_firefox_policy() {
-  set_firefox_paths
-  [[ -d "$firefox_backup_dir" ]] || {
+  set_firefox_paths || return 1
+  [[ -e "$firefox_backup_dir" || -L "$firefox_backup_dir" ]] || {
     echo "No backup found; refusing to remove a Firefox policy that may predate this tool." >&2
-    exit 1
+    return 1
+  }
+  validate_firefox_backup || {
+    echo "Firefox backup is unreadable, invalid, or belongs to another application path." >&2
+    return 1
   }
 
-  if [[ -e "$firefox_policy_target" || -L "$firefox_policy_target" ]]; then
-    owns_firefox_policy || {
-      echo "Refusing to remove a Firefox policy changed after the backup was created." >&2
-      exit 1
+  if owns_firefox_policy; then
+    restore_firefox_policy || {
+      echo "Failed to restore the previous Firefox policy; the backup was kept." >&2
+      return 1
     }
-    rm "$firefox_policy_target"
+  elif ! firefox_target_matches_backup; then
+    echo "Refusing to remove a Firefox policy changed after the backup was created." >&2
+    return 1
   fi
 
-  restore_firefox_policy || {
-    echo "Failed to restore the previous Firefox policy" >&2
-    exit 1
-  }
-  rm -rf "$firefox_backup_dir"
+  rm -rf "$firefox_backup_dir" || return 1
   rmdir "$state_root" 2>/dev/null || true
   echo "Restored the previous Firefox policy. Fully quit and reopen Firefox."
 }
